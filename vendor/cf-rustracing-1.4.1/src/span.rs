@@ -1,0 +1,921 @@
+//! Span.
+use crate::carrier;
+use crate::convert::MaybeAsRef;
+use crate::log::{Log, LogBuilder, StdErrorLogFieldsBuilder};
+use crate::sampler::{AllSampler, Sampler};
+use crate::tag::{StdTag, Tag, TagValue};
+use crate::Result;
+use std::borrow::Cow;
+use std::fmt;
+use std::io::{Read, Write};
+use std::sync::Arc;
+use std::time::SystemTime;
+use tokio::sync::mpsc;
+
+/// Generic interface to receive [`FinishedSpan`]s from rustracing.
+pub trait SpanConsumer<T>: Send + Sync {
+    /// Consumes a [`FinishedSpan`] when the application closes a span.
+    ///
+    /// This should not block the caller for any significant amount of time.
+    /// It is better to drop spans if the consumer is overloaded.
+    fn consume_span(&self, span: FinishedSpan<T>);
+}
+
+impl<T: Send> SpanConsumer<T> for mpsc::UnboundedSender<FinishedSpan<T>> {
+    fn consume_span(&self, span: FinishedSpan<T>) {
+        let _ = self.send(span);
+    }
+}
+
+impl<T: Send> SpanConsumer<T> for mpsc::Sender<FinishedSpan<T>> {
+    fn consume_span(&self, span: FinishedSpan<T>) {
+        let _ = self.try_send(span);
+    }
+}
+
+impl<T: Send> SpanConsumer<T> for std::sync::mpsc::Sender<FinishedSpan<T>> {
+    fn consume_span(&self, span: FinishedSpan<T>) {
+        let _ = self.send(span);
+    }
+}
+
+impl<T: Send> SpanConsumer<T> for std::sync::mpsc::SyncSender<FinishedSpan<T>> {
+    fn consume_span(&self, span: FinishedSpan<T>) {
+        let _ = self.try_send(span);
+    }
+}
+
+/// Unbounded [`tokio::sync::mpsc`] receiver for finished spans.
+pub type SpanReceiver<T> = mpsc::UnboundedReceiver<FinishedSpan<T>>;
+/// Deprecated: alias for default [`SpanConsumer`] implementation.
+#[deprecated = "SpanSender is an implementation detail of rustracing. It should not be public."]
+pub type SpanSender<T> = mpsc::UnboundedSender<FinishedSpan<T>>;
+
+/// An `Arc<dyn SpanConsumer>` wrapper to implement `Debug` on.
+pub(crate) struct SharedSpanConsumer<T>(Arc<dyn SpanConsumer<T>>);
+
+impl<T> SharedSpanConsumer<T> {
+    pub(crate) fn new(consumer: impl SpanConsumer<T> + 'static) -> Self {
+        Self(Arc::new(consumer))
+    }
+}
+
+impl<T> fmt::Debug for SharedSpanConsumer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("SharedSpanConsumer")
+    }
+}
+
+impl<T> Clone for SharedSpanConsumer<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+/// Callback to execute before a [`Span`] is finalized.
+pub struct FinishSpanCallback<T>(FinishCallbackInner<T>);
+type FinishCallbackInner<T> = Arc<dyn Fn(&mut Span<T>) + Send + Sync>;
+
+impl<T> fmt::Debug for FinishSpanCallback<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("FinishSpanCallback")
+    }
+}
+
+impl<T> Clone for FinishSpanCallback<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> From<FinishSpanCallback<T>> for FinishCallbackInner<T> {
+    fn from(v: FinishSpanCallback<T>) -> Self {
+        v.0
+    }
+}
+
+impl<T> From<FinishCallbackInner<T>> for FinishSpanCallback<T> {
+    fn from(v: FinishCallbackInner<T>) -> Self {
+        Self(v)
+    }
+}
+
+impl<T, F: Fn(&mut Span<T>) + Send + Sync + 'static> From<F> for FinishSpanCallback<T> {
+    fn from(v: F) -> Self {
+        Self(Arc::new(v))
+    }
+}
+
+/// Caller-defined routing attached to a span, inherited by children, and read by
+/// the exporter to route the resulting [`FinishedSpan`].
+pub trait RoutingMetadata: fmt::Debug + Send + Sync {
+    /// Batching key: spans sharing it are exported together. Must differ
+    /// whenever [`encode`](RoutingMetadata::encode) would.
+    fn group_key(&self) -> String;
+
+    /// The value the exporter transmits for this routing.
+    fn encode(&self) -> String;
+}
+
+/// Span.
+///
+/// When this span is dropped, it will be converted to `FinishedSpan` and
+/// it will be sent to the associated `SpanReceiver`.
+#[derive(Debug)]
+pub struct Span<T>(Option<SpanInner<T>>);
+impl<T> Span<T> {
+    /// Makes an inactive span.
+    ///
+    /// This span is never traced.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cf_rustracing::span::Span;
+    ///
+    /// let span = Span::<()>::inactive();
+    /// assert!(! span.is_sampled());
+    /// ```
+    pub const fn inactive() -> Self {
+        Span(None)
+    }
+
+    /// Returns a handle of this span.
+    pub fn handle(&self) -> SpanHandle<T>
+    where
+        T: Clone,
+    {
+        SpanHandle(
+            self.0
+                .as_ref()
+                .map(|inner| (inner.context.clone(), inner.span_tx.clone())),
+        )
+    }
+
+    /// Returns `true` if this span is sampled (i.e., being traced).
+    pub fn is_sampled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Returns the context of this span.
+    pub fn context(&self) -> Option<&SpanContext<T>> {
+        self.0.as_ref().map(|x| &x.context)
+    }
+
+    /// Sets the operation name of this span.
+    pub fn set_operation_name<F, N>(&mut self, f: F)
+    where
+        F: FnOnce() -> N,
+        N: Into<Cow<'static, str>>,
+    {
+        if let Some(inner) = self.0.as_mut() {
+            inner.operation_name = f().into();
+        }
+    }
+
+    /// Sets the start time of this span.
+    pub fn set_start_time<F>(&mut self, f: F)
+    where
+        F: FnOnce() -> SystemTime,
+    {
+        if let Some(inner) = self.0.as_mut() {
+            inner.start_time = f();
+        }
+    }
+
+    /// Sets the finish time of this span.
+    pub fn set_finish_time<F>(&mut self, f: F)
+    where
+        F: FnOnce() -> SystemTime,
+    {
+        if let Some(inner) = self.0.as_mut() {
+            inner.finish_time = Some(f());
+        }
+    }
+
+    /// Sets the finish callback for this span.
+    pub fn set_finish_callback<C>(&mut self, cb: C)
+    where
+        C: Into<FinishSpanCallback<T>>,
+    {
+        if let Some(inner) = &mut self.0 {
+            inner.finish_cb = Some(cb.into());
+        }
+    }
+
+    /// Extracts any inherited or explicitly added finish callback from this span.
+    ///
+    /// This can be used either to unset the callback, by discarding the returned value,
+    /// or to wrap it in a new callback.
+    #[doc(alias = "remove_finish_callback")]
+    pub fn take_finish_callback(&mut self) -> Option<FinishSpanCallback<T>> {
+        self.0.as_mut().and_then(|s| s.finish_cb.take())
+    }
+
+    /// Discards this span, so it is never sent to the associated `SpanReceiver`.
+    ///
+    /// The finish callback, if any, is dropped without being called. Afterwards the span behaves
+    /// like an [inactive](Self::inactive) one.
+    ///
+    /// Children of this span that were already finished, and contexts propagated from it, keep
+    /// referencing this span, which will never be received.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cf_rustracing::sampler::AllSampler;
+    /// use cf_rustracing::Tracer;
+    ///
+    /// let (tracer, mut span_rx) = Tracer::new(AllSampler);
+    /// let mut span = tracer.span("discarded").start_with_state(());
+    /// span.discard();
+    /// assert!(!span.is_sampled());
+    /// drop(span);
+    /// assert!(span_rx.try_recv().is_err());
+    /// ```
+    pub fn discard(&mut self) {
+        self.take_finish_callback();
+        self.0 = None;
+    }
+
+    /// Sets the tag to this span.
+    pub fn set_tag<F>(&mut self, f: F)
+    where
+        F: FnOnce() -> Tag,
+    {
+        use std::iter::once;
+        self.set_tags(|| once(f()));
+    }
+
+    /// Sets the tags to this span.
+    pub fn set_tags<F, I>(&mut self, f: F)
+    where
+        F: FnOnce() -> I,
+        I: IntoIterator<Item = Tag>,
+    {
+        if let Some(inner) = self.0.as_mut() {
+            for tag in f() {
+                inner.tags.retain(|x| x.name() != tag.name());
+                inner.tags.push(tag);
+            }
+        }
+    }
+
+    /// Sets the baggage item to this span.
+    pub fn set_baggage_item<F>(&mut self, f: F)
+    where
+        F: FnOnce() -> BaggageItem,
+    {
+        if let Some(inner) = self.0.as_mut() {
+            let item = f();
+            inner.context.baggage_items.retain(|x| x.name != item.name);
+            inner.context.baggage_items.push(item);
+        }
+    }
+
+    /// Gets the baggage item that has the name `name`.
+    pub fn get_baggage_item(&self, name: &str) -> Option<&BaggageItem> {
+        if let Some(inner) = self.0.as_ref() {
+            inner.context.baggage_items.iter().find(|x| x.name == name)
+        } else {
+            None
+        }
+    }
+
+    /// Logs structured data.
+    pub fn log<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut LogBuilder),
+    {
+        if let Some(inner) = self.0.as_mut() {
+            let mut builder = LogBuilder::new();
+            f(&mut builder);
+            if let Some(log) = builder.finish() {
+                inner.logs.push(log);
+            }
+        }
+    }
+
+    /// Logs an error.
+    ///
+    /// This is a simple wrapper of `log` method
+    /// except that the `StdTag::error()` tag will be set in this method.
+    pub fn error_log<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut StdErrorLogFieldsBuilder),
+    {
+        if let Some(inner) = self.0.as_mut() {
+            let mut builder = LogBuilder::new();
+            f(&mut builder.error());
+            if let Some(log) = builder.finish() {
+                inner.logs.push(log);
+            }
+            if !inner.tags.iter().any(|x| x.name() == "error") {
+                inner.tags.push(StdTag::error());
+            }
+        }
+    }
+
+    /// Starts a `ChildOf` span if this span is sampled.
+    ///
+    /// The child will inherit this span's finish callback and routing metadata,
+    /// if set. To avoid this kind of inheritance, you can use
+    /// `span.handle().child(...)` instead.
+    pub fn child<N, F>(&self, operation_name: N, f: F) -> Span<T>
+    where
+        N: Into<Cow<'static, str>>,
+        T: Clone,
+        F: FnOnce(StartSpanOptions<AllSampler, T>) -> Span<T>,
+    {
+        self.handle().child(operation_name, move |mut opts| {
+            if let Some(finish_cb) = self.0.as_ref().and_then(|s| s.finish_cb.clone()) {
+                opts = opts.finish_callback(finish_cb);
+            }
+            if let Some(routing) = self.0.as_ref().and_then(|s| s.routing.clone()) {
+                opts = opts.routing(routing);
+            }
+            f(opts)
+        })
+    }
+
+    /// Starts a `FollowsFrom` span if this span is sampled.
+    pub fn follower<N, F>(&self, operation_name: N, f: F) -> Span<T>
+    where
+        N: Into<Cow<'static, str>>,
+        T: Clone,
+        F: FnOnce(StartSpanOptions<AllSampler, T>) -> Span<T>,
+    {
+        self.handle().follower(operation_name, f)
+    }
+
+    pub(crate) fn new<S>(state: T, opts: StartSpanOptions<S, T>) -> Self {
+        let context = SpanContext::new(state, opts.baggage_items);
+        let inner = SpanInner {
+            operation_name: opts.operation_name,
+            start_time: opts.start_time.unwrap_or_else(SystemTime::now),
+            finish_time: None,
+            references: opts.references,
+            tags: opts.tags,
+            logs: Vec::new(),
+            context,
+            finish_cb: opts.finish_cb,
+            span_tx: opts.span_tx.clone(),
+            routing: opts.routing,
+        };
+        Span(Some(inner))
+    }
+}
+impl<T> Drop for Span<T> {
+    fn drop(&mut self) {
+        if let Some(finish_cb) = self.take_finish_callback() {
+            finish_cb.0(self);
+        }
+
+        if let Some(inner) = self.0.take() {
+            let finished = FinishedSpan {
+                operation_name: inner.operation_name,
+                start_time: inner.start_time,
+                finish_time: inner.finish_time.unwrap_or_else(SystemTime::now),
+                references: inner.references,
+                tags: inner.tags,
+                logs: inner.logs,
+                context: inner.context,
+                routing: inner.routing,
+            };
+            inner.span_tx.0.consume_span(finished);
+        }
+    }
+}
+impl<T> MaybeAsRef<SpanContext<T>> for Span<T> {
+    fn maybe_as_ref(&self) -> Option<&SpanContext<T>> {
+        self.context()
+    }
+}
+
+#[derive(Debug)]
+struct SpanInner<T> {
+    operation_name: Cow<'static, str>,
+    start_time: SystemTime,
+    finish_time: Option<SystemTime>,
+    references: Vec<SpanReference<T>>,
+    tags: Vec<Tag>,
+    logs: Vec<Log>,
+    context: SpanContext<T>,
+    finish_cb: Option<FinishSpanCallback<T>>,
+    span_tx: SharedSpanConsumer<T>,
+    routing: Option<Arc<dyn RoutingMetadata>>,
+}
+
+/// Finished span.
+#[derive(Debug)]
+pub struct FinishedSpan<T> {
+    operation_name: Cow<'static, str>,
+    start_time: SystemTime,
+    finish_time: SystemTime,
+    references: Vec<SpanReference<T>>,
+    tags: Vec<Tag>,
+    logs: Vec<Log>,
+    context: SpanContext<T>,
+    routing: Option<Arc<dyn RoutingMetadata>>,
+}
+impl<T> FinishedSpan<T> {
+    /// Returns the operation name of this span.
+    pub fn operation_name(&self) -> &str {
+        self.operation_name.as_ref()
+    }
+
+    /// Returns the start time of this span.
+    pub fn start_time(&self) -> SystemTime {
+        self.start_time
+    }
+
+    /// Returns the finish time of this span.
+    pub fn finish_time(&self) -> SystemTime {
+        self.finish_time
+    }
+
+    /// Returns the logs recorded during this span.
+    pub fn logs(&self) -> &[Log] {
+        &self.logs
+    }
+
+    /// Returns the tags of this span.
+    pub fn tags(&self) -> &[Tag] {
+        &self.tags
+    }
+
+    /// Returns the references of this span.
+    pub fn references(&self) -> &[SpanReference<T>] {
+        &self.references
+    }
+
+    /// Returns the context of this span.
+    pub fn context(&self) -> &SpanContext<T> {
+        &self.context
+    }
+
+    /// Returns the routing metadata of this span, if any was set.
+    pub fn routing(&self) -> Option<&dyn RoutingMetadata> {
+        self.routing.as_deref()
+    }
+}
+
+/// Span context.
+///
+/// Each `SpanContext` encapsulates the following state:
+///
+/// - `T`: OpenTracing-implementation-dependent state (for example, trace and span ids) needed to refer to a distinct `Span` across a process boundary
+/// - `BaggageItems`: These are just key:value pairs that cross process boundaries
+#[derive(Debug, Clone)]
+pub struct SpanContext<T> {
+    state: T,
+    baggage_items: Vec<BaggageItem>,
+}
+impl<T> SpanContext<T> {
+    /// Makes a new `SpanContext` instance.
+    pub fn new(state: T, mut baggage_items: Vec<BaggageItem>) -> Self {
+        baggage_items.reverse();
+        baggage_items.sort_by(|a, b| a.name().cmp(b.name()));
+        baggage_items.dedup_by(|a, b| a.name() == b.name());
+        SpanContext {
+            state,
+            baggage_items,
+        }
+    }
+
+    /// Returns the implementation-dependent state of this context.
+    pub fn state(&self) -> &T {
+        &self.state
+    }
+
+    /// Returns the baggage items associated with this context.
+    pub fn baggage_items(&self) -> &[BaggageItem] {
+        &self.baggage_items
+    }
+
+    /// Injects this context to the **Text Map** `carrier`.
+    pub fn inject_to_text_map<C>(&self, carrier: &mut C) -> Result<()>
+    where
+        C: carrier::TextMap,
+        T: carrier::InjectToTextMap<C>,
+    {
+        track!(T::inject_to_text_map(self, carrier))
+    }
+
+    /// Injects this context to the **HTTP Header** `carrier`.
+    pub fn inject_to_http_header<C>(&self, carrier: &mut C) -> Result<()>
+    where
+        C: carrier::SetHttpHeaderField,
+        T: carrier::InjectToHttpHeader<C>,
+    {
+        track!(T::inject_to_http_header(self, carrier))
+    }
+
+    /// Injects this context to the **Binary** `carrier`.
+    pub fn inject_to_binary<C>(&self, carrier: &mut C) -> Result<()>
+    where
+        C: Write,
+        T: carrier::InjectToBinary<C>,
+    {
+        track!(T::inject_to_binary(self, carrier))
+    }
+
+    /// Extracts a context from the **Text Map** `carrier`.
+    pub fn extract_from_text_map<C>(carrier: &C) -> Result<Option<Self>>
+    where
+        C: carrier::TextMap,
+        T: carrier::ExtractFromTextMap<C>,
+    {
+        track!(T::extract_from_text_map(carrier))
+    }
+
+    /// Extracts a context from the **HTTP Header** `carrier`.
+    pub fn extract_from_http_header<'a, C>(carrier: &'a C) -> Result<Option<Self>>
+    where
+        C: carrier::IterHttpHeaderFields<'a>,
+        T: carrier::ExtractFromHttpHeader<'a, C>,
+    {
+        track!(T::extract_from_http_header(carrier))
+    }
+
+    /// Extracts a context from the **Binary** `carrier`.
+    pub fn extract_from_binary<C>(carrier: &mut C) -> Result<Option<Self>>
+    where
+        C: Read,
+        T: carrier::ExtractFromBinary<C>,
+    {
+        track!(T::extract_from_binary(carrier))
+    }
+}
+impl<T> MaybeAsRef<SpanContext<T>> for SpanContext<T> {
+    fn maybe_as_ref(&self) -> Option<&Self> {
+        Some(self)
+    }
+}
+
+/// Baggage item.
+///
+/// `BaggageItem`s are key:value string pairs that apply to a `Span`, its `SpanContext`,
+/// and all `Span`s which directly or transitively reference the local `Span`.
+/// That is, `BaggageItem`s propagate in-band along with the trace itself.
+///
+/// `BaggageItem`s enable powerful functionality given a full-stack OpenTracing integration
+/// (for example, arbitrary application data from a mobile app can make it, transparently,
+/// all the way into the depths of a storage system),
+/// and with it some powerful costs: use this feature with care.
+///
+/// Use this feature thoughtfully and with care.
+/// Every key and value is copied into every local and remote child of the associated `Span`,
+/// and that can add up to a lot of network and cpu overhead.
+#[derive(Debug, Clone)]
+pub struct BaggageItem {
+    name: String,
+    value: String,
+}
+impl BaggageItem {
+    /// Makes a new `BaggageItem` instance.
+    pub fn new(name: &str, value: &str) -> Self {
+        BaggageItem {
+            name: name.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    /// Returns the name of this item.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the value of this item.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+/// Span reference.
+#[derive(Debug, Clone)]
+#[allow(missing_docs)]
+pub enum SpanReference<T> {
+    ChildOf(T),
+    FollowsFrom(T),
+}
+impl<T> SpanReference<T> {
+    /// Returns the span context state of this reference.
+    pub fn span(&self) -> &T {
+        match *self {
+            SpanReference::ChildOf(ref x) | SpanReference::FollowsFrom(ref x) => x,
+        }
+    }
+
+    /// Returns `true` if this is a `ChildOf` reference.
+    pub fn is_child_of(&self) -> bool {
+        matches!(*self, SpanReference::ChildOf(_))
+    }
+
+    /// Returns `true` if this is a `FollowsFrom` reference.
+    pub fn is_follows_from(&self) -> bool {
+        matches!(*self, SpanReference::FollowsFrom(_))
+    }
+}
+
+/// Candidate span for tracing.
+#[derive(Debug)]
+pub struct CandidateSpan<'a, T: 'a> {
+    tags: &'a [Tag],
+    references: &'a [SpanReference<T>],
+    baggage_items: &'a [BaggageItem],
+}
+impl<'a, T: 'a> CandidateSpan<'a, T> {
+    /// Returns the tags of this span.
+    pub fn tags(&self) -> &[Tag] {
+        self.tags
+    }
+
+    /// Returns the references of this span.
+    pub fn references(&self) -> &[SpanReference<T>] {
+        self.references
+    }
+
+    /// Returns the baggage items of this span.
+    pub fn baggage_items(&self) -> &[BaggageItem] {
+        self.baggage_items
+    }
+}
+
+/// Options for starting a span.
+#[derive(Debug)]
+pub struct StartSpanOptions<'a, S: 'a, T: 'a> {
+    operation_name: Cow<'static, str>,
+    start_time: Option<SystemTime>,
+    tags: Vec<Tag>,
+    references: Vec<SpanReference<T>>,
+    baggage_items: Vec<BaggageItem>,
+    finish_cb: Option<FinishSpanCallback<T>>,
+    routing: Option<Arc<dyn RoutingMetadata>>,
+    span_tx: &'a SharedSpanConsumer<T>,
+    sampler: &'a S,
+}
+impl<'a, S: 'a, T: 'a> StartSpanOptions<'a, S, T>
+where
+    S: Sampler<T>,
+{
+    /// Sets the start time of this span.
+    pub fn start_time(mut self, time: SystemTime) -> Self {
+        self.start_time = Some(time);
+        self
+    }
+
+    /// Sets the tag to this span.
+    pub fn tag(mut self, tag: Tag) -> Self {
+        self.tags.push(tag);
+        self
+    }
+
+    /// Sets the finish callback for this span.
+    pub fn finish_callback<C>(mut self, cb: C) -> Self
+    where
+        C: Into<FinishSpanCallback<T>>,
+    {
+        self.finish_cb = Some(cb.into());
+        self
+    }
+
+    /// Attaches routing metadata to the span being built.
+    ///
+    /// The metadata is carried into the resulting [`FinishedSpan`] for the
+    /// exporter to read, and is inherited by child spans (see [`Span::child`]).
+    /// This is the only way to set routing — there is no live setter, so routing
+    /// cannot be changed or cleared after the span has started.
+    pub fn routing(mut self, routing: Arc<dyn RoutingMetadata>) -> Self {
+        self.routing = Some(routing);
+        self
+    }
+
+    /// Adds the `ChildOf` reference to this span.
+    pub fn child_of<C>(mut self, context: &C) -> Self
+    where
+        C: MaybeAsRef<SpanContext<T>>,
+        T: Clone,
+    {
+        if let Some(context) = context.maybe_as_ref() {
+            let reference = SpanReference::ChildOf(context.state().clone());
+            self.references.push(reference);
+            self.baggage_items
+                .extend(context.baggage_items().iter().cloned());
+        }
+        self
+    }
+
+    /// Adds the `FollowsFrom` reference to this span.
+    pub fn follows_from<C>(mut self, context: &C) -> Self
+    where
+        C: MaybeAsRef<SpanContext<T>>,
+        T: Clone,
+    {
+        if let Some(context) = context.maybe_as_ref() {
+            let reference = SpanReference::FollowsFrom(context.state().clone());
+            self.references.push(reference);
+            self.baggage_items
+                .extend(context.baggage_items().iter().cloned());
+        }
+        self
+    }
+
+    /// Starts a new span.
+    pub fn start(mut self) -> Span<T>
+    where
+        T: for<'b> From<CandidateSpan<'b, T>>,
+    {
+        self.normalize();
+        if !self.is_sampled() {
+            return Span(None);
+        }
+        let state = T::from(self.span());
+        Span::new(state, self)
+    }
+
+    /// Starts a new span with the explicit `state`.
+    pub fn start_with_state(mut self, state: T) -> Span<T> {
+        self.normalize();
+        if !self.is_sampled() {
+            return Span(None);
+        }
+        Span::new(state, self)
+    }
+
+    pub(crate) fn new<N>(
+        operation_name: N,
+        span_tx: &'a SharedSpanConsumer<T>,
+        sampler: &'a S,
+    ) -> Self
+    where
+        N: Into<Cow<'static, str>>,
+    {
+        StartSpanOptions {
+            operation_name: operation_name.into(),
+            start_time: None,
+            tags: Vec::new(),
+            references: Vec::new(),
+            baggage_items: Vec::new(),
+            finish_cb: None,
+            routing: None,
+            span_tx,
+            sampler,
+        }
+    }
+
+    fn normalize(&mut self) {
+        self.tags.reverse();
+        self.tags.sort_by(|a, b| a.name().cmp(b.name()));
+        self.tags.dedup_by(|a, b| a.name() == b.name());
+
+        self.baggage_items.reverse();
+        self.baggage_items.sort_by(|a, b| a.name().cmp(b.name()));
+        self.baggage_items.dedup_by(|a, b| a.name() == b.name());
+    }
+
+    fn span(&self) -> CandidateSpan<'_, T> {
+        CandidateSpan {
+            references: &self.references,
+            tags: &self.tags,
+            baggage_items: &self.baggage_items,
+        }
+    }
+
+    fn is_sampled(&self) -> bool {
+        if let Some(&TagValue::Integer(n)) = self
+            .tags
+            .iter()
+            .find(|t| t.name() == "sampling.priority")
+            .map(|t| t.value())
+        {
+            n > 0
+        } else {
+            self.sampler.is_sampled(&self.span())
+        }
+    }
+}
+
+/// Immutable handle of `Span`.
+#[derive(Debug, Clone)]
+pub struct SpanHandle<T>(Option<(SpanContext<T>, SharedSpanConsumer<T>)>);
+impl<T> SpanHandle<T> {
+    /// Returns `true` if this span is sampled (i.e., being traced).
+    pub fn is_sampled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Returns the context of this span.
+    pub fn context(&self) -> Option<&SpanContext<T>> {
+        self.0.as_ref().map(|(context, _)| context)
+    }
+
+    /// Gets the baggage item that has the name `name`.
+    pub fn get_baggage_item(&self, name: &str) -> Option<&BaggageItem> {
+        if let Some(context) = self.context() {
+            context.baggage_items.iter().find(|x| x.name == name)
+        } else {
+            None
+        }
+    }
+
+    /// Starts a `ChildOf` span if this span is sampled.
+    pub fn child<N, F>(&self, operation_name: N, f: F) -> Span<T>
+    where
+        N: Into<Cow<'static, str>>,
+        T: Clone,
+        F: FnOnce(StartSpanOptions<AllSampler, T>) -> Span<T>,
+    {
+        if let Some((context, span_tx)) = self.0.as_ref() {
+            let options =
+                StartSpanOptions::new(operation_name, span_tx, &AllSampler).child_of(context);
+            f(options)
+        } else {
+            Span::inactive()
+        }
+    }
+
+    /// Starts a `FollowsFrom` span if this span is sampled.
+    pub fn follower<N, F>(&self, operation_name: N, f: F) -> Span<T>
+    where
+        N: Into<Cow<'static, str>>,
+        T: Clone,
+        F: FnOnce(StartSpanOptions<AllSampler, T>) -> Span<T>,
+    {
+        if let Some((context, span_tx)) = self.0.as_ref() {
+            let options =
+                StartSpanOptions::new(operation_name, span_tx, &AllSampler).follows_from(context);
+            f(options)
+        } else {
+            Span::inactive()
+        }
+    }
+}
+
+/// Extension trait for inspecting an in-progress `Span`.
+pub trait InspectableSpan<T> {
+    /// Returns the operation name of this span.
+    fn operation_name(&self) -> &str;
+
+    /// Returns the start time of this span.
+    fn start_time(&self) -> SystemTime;
+
+    /// Returns the finish time of this span, if it has finished.
+    fn finish_time(&self) -> Option<SystemTime>;
+
+    /// Returns the logs recorded during this span.
+    fn logs(&self) -> &[Log];
+
+    /// Returns the tags of this span.
+    fn tags(&self) -> &[Tag];
+
+    /// Returns the references of this span.
+    fn references(&self) -> &[SpanReference<T>];
+}
+
+impl<T> InspectableSpan<T> for Span<T> {
+    /// Returns the operation name of this span.
+    fn operation_name(&self) -> &str {
+        self.0
+            .as_ref()
+            .map(|inner| inner.operation_name.as_ref())
+            .unwrap_or("")
+    }
+
+    /// Returns the start time of this span.
+    fn start_time(&self) -> SystemTime {
+        self.0
+            .as_ref()
+            .map(|inner| inner.start_time)
+            .unwrap_or_else(SystemTime::now)
+    }
+
+    /// Returns the finish time of this span.
+    fn finish_time(&self) -> Option<SystemTime> {
+        self.0.as_ref().and_then(|inner| inner.finish_time)
+    }
+
+    /// Returns the logs recorded during this span.
+    fn logs(&self) -> &[Log] {
+        self.0
+            .as_ref()
+            .map(|inner| inner.logs.as_ref())
+            .unwrap_or(&[])
+    }
+
+    /// Returns the tags of this span.
+    fn tags(&self) -> &[Tag] {
+        self.0
+            .as_ref()
+            .map(|inner| inner.tags.as_ref())
+            .unwrap_or(&[])
+    }
+
+    /// Returns the references of this span.
+    fn references(&self) -> &[SpanReference<T>] {
+        self.0
+            .as_ref()
+            .map(|inner| inner.references.as_ref())
+            .unwrap_or(&[])
+    }
+}
